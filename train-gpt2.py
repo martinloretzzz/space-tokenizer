@@ -29,6 +29,8 @@ min_lr = max_lr * 0.1
 warmup_steps = 500 # 715
 max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
+checkpoint_path = "model_01000.pt" # None
+
 # %%
 with open('wandb.txt', 'r') as file:
     wandb_key = file.read()
@@ -124,10 +126,10 @@ class GPT(nn.Module):
                 ln_f = nn.LayerNorm(config.n_embd),
             ))
 
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd - 2, config.vocab_size, bias=False)
         if TRAIN_SPACE:
-            self.emb_ids = nn.Embedding(config.vocab_size, config.n_embd)
-            self.emb_space_case = nn.Linear(2, config.n_embd, bias=False)
+            self.emb_ids = nn.Embedding(config.vocab_size, config.n_embd - 2)
+            # self.emb_space_case = nn.Linear(2, config.n_embd, bias=False)
 
             self.emb_ids.weight = self.lm_head.weight
         else:
@@ -139,7 +141,7 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         if TRAIN_SPACE:
             torch.nn.init.normal_(self.emb_ids.weight, mean=0.0, std=0.02)
-            torch.nn.init.normal_(self.emb_space_case.weight, mean=0.0, std=0.0000002)
+            # torch.nn.init.normal_(self.emb_space_case.weight, mean=0.0, std=0.0000002)
 
 
     def _init_weights(self, module):
@@ -165,10 +167,12 @@ class GPT(nn.Module):
         if TRAIN_SPACE:
             # token embeddings of shape (B, T, n_embd)
             ids, space, upper = self.unpack_token(idx)
-            space = space.unsqueeze(-1)
-            upper = upper.unsqueeze(-1)
-            space_case = torch.cat([space, upper], dim=-1).to(torch.bfloat16)
-            tok_emb = self.emb_ids(ids) + self.emb_space_case(space_case)
+            space = 0.1 * (space.unsqueeze(-1).to(torch.bfloat16) - 0.5) # either -0.05 and +0.05
+            upper = 0.1 * (upper.unsqueeze(-1).to(torch.bfloat16) - 0.5)
+            # space_case = torch.cat([space, upper], dim=-1)
+            # tok_emb = self.emb_ids(ids) + self.emb_space_case(space_case)
+
+            tok_emb = torch.cat([self.emb_ids(ids), space, upper], dim=-1)
         else:
             tok_emb = self.transformer.wte(idx)
 
@@ -179,26 +183,33 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
 
-        logits = self.lm_head(x)
+
         if TRAIN_SPACE:
             # logits_space = self.lm_head_space(x)
             # logits_case = self.lm_head_case(x)
-            logits_space_case = F.linear(x, self.emb_space_case.weight.T)
-            logits_space, logits_case = torch.split(logits_space_case, 1, dim=-1)
+            # logits_space_case = F.linear(x, self.emb_space_case.weight.T)
+            # logits_space, logits_case = torch.split(logits_space_case, 1, dim=-1)
+            # TODO modify layernorm final to exclude space and upper
+            x_embed, logits_space, logits_case = torch.split(x, [self.config.n_embd-2,1,1], dim=-1)
+            logits_space = 10 * logits_space # allow a small output to saturate softmax
+            logits_case = 10 * logits_case
+            logits = self.lm_head(x_embed)
+            # print(logits.shape, logits_space.shape, logits_case.shape)
         else:
+            logits = self.lm_head(x)
             logits_space = torch.zeros((B, T, 1))
             logits_case = torch.zeros((B, T, 1))
 
         loss_out = None
         if targets is not None:
             if TRAIN_SPACE:
-                targets_ids, targets_space, targets_upper = self.unpack_token(targets)
+                targets_ids, targets_space, targets_case = self.unpack_token(targets)
 
                 loss_ids = F.cross_entropy(logits.view(-1, logits.size(-1)), targets_ids.view(-1))
                 loss_space = F.binary_cross_entropy_with_logits(logits_space.view(-1), targets_space.view(-1).to(torch.bfloat16))
-                loss_case = F.binary_cross_entropy_with_logits(logits_case.view(-1), targets_upper.view(-1).to(torch.bfloat16))
+                loss_case = F.binary_cross_entropy_with_logits(logits_case.view(-1), targets_case.view(-1).to(torch.bfloat16))
 
-                loss = loss_ids + loss_space + loss_case
+                loss = loss_ids + 0.001 * loss_space + 0.001 * loss_case
                 loss_out = (loss, loss_ids, loss_space, loss_case)
             else:
                 loss_ids = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
@@ -403,6 +414,15 @@ torch.set_float32_matmul_precision('high')
 vocab_size = (25000 + 257) if TRAIN_SPACE else 50257
 model = GPT(GPTConfig(vocab_size=vocab_size))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
+
+start_step = 0
+if checkpoint_path is not None:
+    loaded = torch.load(checkpoint_path, weights_only=False)
+    start_step = loaded["step"]
+    model_checkpoint = loaded["model"]
+    model.load_state_dict(model_checkpoint)
+    print(f"Load model from {checkpoint_path}. Continue at step {start_step}.")
+
 model.to(device)
 use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
@@ -573,7 +593,7 @@ if master_process:
         },
     )
 
-for step in range(max_steps):
+for step in range(start_step, max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
@@ -725,10 +745,11 @@ for step in range(max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         if step % 10 == 0:
-            print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | norm_space: {norm_space:.8f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+            print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | norm_space: {norm_space:.8f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}") #  | lids: {loss_accum_ids.item():.4f} | lspace: {loss_accum_space.item():.4f} | lcase: {loss_accum_case.item():.4f}
         run.log({"step": step, "loss": loss_accum.item(), "loss_ids": loss_accum_ids.item(), "loss_space": loss_accum_space.item(), "loss_case": loss_accum_case.item(), "lr":lr, "norm":norm, "norm_space": norm_space, "dt":1000*dt, "tokens_per_sec": tokens_per_sec })
 
-run.finish()
+if master_process:
+    run.finish()
 
 if ddp:
     destroy_process_group()
