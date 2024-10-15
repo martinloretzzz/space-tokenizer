@@ -21,8 +21,8 @@ from torch.nn import functional as F
 TRAIN_SPACE = True
 data_root = "dataset-25K/content/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
 
-total_batch_size = 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
-B = 48 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
+total_batch_size = 262144 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
+B = 32 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
 T = 1024 # sequence length
 
 max_lr = 6e-4
@@ -30,7 +30,7 @@ min_lr = max_lr * 0.1
 warmup_steps = 500 # 715
 max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
-checkpoint_path = "model_03000.pt" # None
+checkpoint_path = None # "model_03000.pt" # None
 
 # %%
 with open('wandb.txt', 'r') as file:
@@ -131,8 +131,11 @@ class GPT(nn.Module):
         if TRAIN_SPACE:
             self.emb_ids = nn.Embedding(config.vocab_size, config.n_embd - 2)
             # self.emb_space_case = nn.Linear(2, config.n_embd, bias=False)
-            self.space_upscaler = nn.Parameter(torch.tensor(0.5))
-            self.case_upscaler = nn.Parameter(torch.tensor(0.5))
+            # self.space_upscaler = nn.Parameter(torch.tensor(0.5))
+            # self.case_upscaler = nn.Parameter(torch.tensor(0.5))
+
+            self.lm_space = nn.Linear(config.n_embd, config.vocab_size)
+            self.lm_case = nn.Linear(config.n_embd, config.vocab_size)
 
             self.emb_ids.weight = self.lm_head.weight
         else:
@@ -144,6 +147,8 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         if TRAIN_SPACE:
             torch.nn.init.normal_(self.emb_ids.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(self.lm_space.weight, mean=0.0, std=0.002)
+            torch.nn.init.normal_(self.lm_case.weight, mean=0.0, std=0.002)
             # torch.nn.init.normal_(self.emb_space_case.weight, mean=0.0, std=0.0000002)
 
 
@@ -192,12 +197,14 @@ class GPT(nn.Module):
             # logits_space_case = F.linear(x, self.emb_space_case.weight.T)
             # logits_space, logits_case = torch.split(logits_space_case, 1, dim=-1)
             # TODO modify layernorm final to exclude space and upper
-            x_embed, logits_space, logits_case = torch.split(x, [self.config.n_embd-2,1,1], dim=-1)
+            x_embed, _, _ = torch.split(x, [self.config.n_embd-2,1,1], dim=-1)
             x_embed = self.transformer.ln_f(x_embed)
 
-            logits_space = self.space_upscaler * logits_space # allow a small output to saturate softmax
-            logits_case = self.case_upscaler * logits_case
+            # logits_space = self.space_upscaler * logits_space # allow a small output to saturate softmax
+            # logits_case = self.case_upscaler * logits_case
             logits = self.lm_head(x_embed)
+            logits_space = self.lm_space(x)
+            logits_case = self.lm_case(x)
             # print(logits.shape, logits_space.shape, logits_case.shape)
         else:
             logits = self.lm_head(x)
@@ -209,18 +216,25 @@ class GPT(nn.Module):
         if targets is not None:
             if TRAIN_SPACE:
                 targets_ids, targets_space, targets_case = self.unpack_token(targets)
+                # print(targets_ids.unsqueeze(-1).shape, logits_space.shape)
+                # logits_space = logits_space[targets_ids.unsqueeze(-1)]
+                # TODO only run lm_space and lm_case on target indices
+
+                logits_space_at_target = torch.gather(logits_space, dim=-1, index=targets_ids.unsqueeze(-1))
+                logits_case_at_target = torch.gather(logits_case, dim=-1, index=targets_ids.unsqueeze(-1))
+                # print(targets_ids.shape, logits_space_at_target.shape, targets_space.shape)
 
                 loss_ids = F.cross_entropy(logits.view(-1, logits.size(-1)), targets_ids.view(-1))
-                loss_space = F.binary_cross_entropy_with_logits(logits_space.view(-1), targets_space.view(-1).to(torch.bfloat16))
-                loss_case = F.binary_cross_entropy_with_logits(logits_case.view(-1), targets_case.view(-1).to(torch.bfloat16))
+                loss_space = F.binary_cross_entropy_with_logits(logits_space_at_target.view(-1), targets_space.view(-1).to(torch.bfloat16))
+                loss_case = F.binary_cross_entropy_with_logits(logits_case_at_target.view(-1), targets_case.view(-1).to(torch.bfloat16))
 
-                loss = loss_ids + 0.000001 * loss_space + 0.000001 * loss_case
+                loss = loss_ids + 0.0001 * loss_space + 0.0001 * loss_case
                 loss_out = (loss, loss_ids, loss_space, loss_case)
 
                 count = targets.view(-1).size(0)
                 y_ids = torch.argmax(logits, dim=-1)
-                y_space = torch.where(logits_space > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long)).squeeze(-1)
-                y_case = torch.where(logits_case > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long)).squeeze(-1)
+                y_space = torch.where(logits_space_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long)).squeeze(-1)
+                y_case = torch.where(logits_case_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long)).squeeze(-1)
 
                 predictions = self.pack_token(y_ids, y_space, y_case)
                 acc = (predictions == targets).sum() / count
@@ -700,8 +714,6 @@ for step in range(start_step, max_steps):
                     logits_id = logits_id[:, -1, :] # (B, vocab_size)
                     logits_space = logits_space[:, -1, :] # (B, vocab_size)
                     logits_case = logits_case[:, -1, :] # (B, vocab_size)
-                    space = torch.where(logits_space > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long))
-                    upper = torch.where(logits_case > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long))
                 else:
                     logits_id = logits[0][:, -1, :]
 
@@ -720,7 +732,17 @@ for step in range(start_step, max_steps):
                 # xcol = torch.argmax(probs, dim=-1)
                 # append to the sequence
                 if TRAIN_SPACE:
+                    # print(logits_space.shape, xcol.shape)
+                    logits_space_at_target = torch.gather(logits_space, dim=-1, index=xcol)
+                    logits_case_at_target = torch.gather(logits_case, dim=-1, index=xcol)
+                    # print(logits_space_at_target.shape)
+
+                    space = torch.where(logits_space_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long))
+                    upper = torch.where(logits_case_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long))
+                    # print(logits_id.shape, logits_space.shape, logits_case.shape, space.shape )
+
                     xcol = pack_token(xcol, space, upper)
+                    # print(xcol.shape)
                 xgen = torch.cat((xgen, xcol), dim=1)
         # print the generated text
         for i in range(num_return_sequences):
@@ -764,10 +786,10 @@ for step in range(start_step, max_steps):
         dist.all_reduce(loss_accum_case, op=dist.ReduceOp.AVG)
         dist.all_reduce(acc, op=dist.ReduceOp.AVG)
 
-    norm_space = raw_model.space_upscaler.data.item() # torch.nn.utils.clip_grad_norm_((param for name, param in model.named_parameters() if name.endswith('emb_space_case.weight')), 0.002)
+    norm_space = 0 # raw_model.space_upscaler.data.item() # torch.nn.utils.clip_grad_norm_((param for name, param in model.named_parameters() if name.endswith('emb_space_case.weight')), 0.002)
 
-    torch.nn.utils.clip_grad_value_(raw_model.space_upscaler, clip_value=0.000001)
-    torch.nn.utils.clip_grad_value_(raw_model.case_upscaler, clip_value=0.000001)
+    # torch.nn.utils.clip_grad_value_(raw_model.space_upscaler, clip_value=0.000001)
+    # torch.nn.utils.clip_grad_value_(raw_model.case_upscaler, clip_value=0.000001)
 
     norm_params = (param for name, param in model.named_parameters() if not name.endswith('upscaler.weight') and not name.endswith('emb_space_case.weight'))
     norm = torch.nn.utils.clip_grad_norm_(norm_params, 1.0)
