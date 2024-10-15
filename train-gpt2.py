@@ -4,23 +4,24 @@
 # unzip /workspace/fineweb-ref.zip -d /workspace/dataset-ref/
 # torchrun --standalone --nproc_per_node=4 train-gpt2.py
 
+import inspect
+import math
 # %%
 import os
-import math
 import time
-import inspect
-import numpy as np
 from dataclasses import dataclass
+
+import numpy as np
+import tiktoken
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 import wandb
-import tiktoken
+from torch.nn import functional as F
 
 TRAIN_SPACE = True
 data_root = "dataset-25K/content/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
 
-total_batch_size = 491520 # 524288 # 2**19, ~0.5M, in number of tokens
+total_batch_size = 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
 B = 48 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
 T = 1024 # sequence length
 
@@ -29,7 +30,7 @@ min_lr = max_lr * 0.1
 warmup_steps = 500 # 715
 max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
-checkpoint_path = "model_01000.pt" # None
+checkpoint_path = "model_03000.pt" # None
 
 # %%
 with open('wandb.txt', 'r') as file:
@@ -116,7 +117,7 @@ class GPT(nn.Module):
             self.transformer = nn.ModuleDict(dict(
                 wpe = nn.Embedding(config.block_size, config.n_embd),
                 h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                ln_f = nn.LayerNorm(config.n_embd),
+                ln_f = nn.LayerNorm(config.n_embd - 2),
             ))
         else:
             self.transformer = nn.ModuleDict(dict(
@@ -130,6 +131,8 @@ class GPT(nn.Module):
         if TRAIN_SPACE:
             self.emb_ids = nn.Embedding(config.vocab_size, config.n_embd - 2)
             # self.emb_space_case = nn.Linear(2, config.n_embd, bias=False)
+            self.space_upscaler = nn.Parameter(torch.tensor(0.5))
+            self.case_upscaler = nn.Parameter(torch.tensor(0.5))
 
             self.emb_ids.weight = self.lm_head.weight
         else:
@@ -181,7 +184,6 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         # forward the final layernorm and the classifier
-        x = self.transformer.ln_f(x)
 
 
         if TRAIN_SPACE:
@@ -191,8 +193,10 @@ class GPT(nn.Module):
             # logits_space, logits_case = torch.split(logits_space_case, 1, dim=-1)
             # TODO modify layernorm final to exclude space and upper
             x_embed, logits_space, logits_case = torch.split(x, [self.config.n_embd-2,1,1], dim=-1)
-            logits_space = 10 * logits_space # allow a small output to saturate softmax
-            logits_case = 10 * logits_case
+            x_embed = self.transformer.ln_f(x_embed)
+
+            logits_space = self.space_upscaler * logits_space # allow a small output to saturate softmax
+            logits_case = self.case_upscaler * logits_case
             logits = self.lm_head(x_embed)
             # print(logits.shape, logits_space.shape, logits_case.shape)
         else:
@@ -200,6 +204,7 @@ class GPT(nn.Module):
             logits_space = torch.zeros((B, T, 1))
             logits_case = torch.zeros((B, T, 1))
 
+        acc_out = None
         loss_out = None
         if targets is not None:
             if TRAIN_SPACE:
@@ -209,19 +214,35 @@ class GPT(nn.Module):
                 loss_space = F.binary_cross_entropy_with_logits(logits_space.view(-1), targets_space.view(-1).to(torch.bfloat16))
                 loss_case = F.binary_cross_entropy_with_logits(logits_case.view(-1), targets_case.view(-1).to(torch.bfloat16))
 
-                loss = loss_ids + 0.001 * loss_space + 0.001 * loss_case
+                loss = loss_ids + 0.000001 * loss_space + 0.000001 * loss_case
                 loss_out = (loss, loss_ids, loss_space, loss_case)
+
+                count = targets.view(-1).size(0)
+                y_ids = torch.argmax(logits, dim=-1)
+                y_space = torch.where(logits_space > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long)).squeeze(-1)
+                y_case = torch.where(logits_case > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long)).squeeze(-1)
+
+                predictions = self.pack_token(y_ids, y_space, y_case)
+                acc = (predictions == targets).sum() / count
+                acc_ids = (y_ids == targets_ids).sum() / count
+                acc_space = (y_space == targets_space).sum() / count
+                acc_case = (y_case == targets_case).sum() / count
+
+                acc_out = (acc, acc_ids, acc_space, acc_case)
             else:
                 loss_ids = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
                 loss_out = (loss_ids, loss_ids, torch.tensor(0), torch.tensor(0))
 
-        return (logits, logits_space, logits_case), loss_out
+        return (logits, logits_space, logits_case), loss_out, acc_out
 
     def unpack_token(self, token):
         id = token >> 2
         space = (token >> 1) & 0x01
         upper = (token >> 0) & 0x01
         return id, space, upper
+
+    def pack_token(self, id, space, upper):
+        return (id << 2) + (space << 1) + (upper << 0)
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -359,10 +380,10 @@ class DataLoaderLite:
 # DDP launch for e.g. 8 GPUs:
 # torchrun --standalone --nproc_per_node=3 train-gpt2.py
 
-# run the training loop
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+# run the training loop
+from torch.distributed import destroy_process_group, init_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # set up DDP (distributed data parallel).
 # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
@@ -433,6 +454,7 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 
 # %%
 import json
+
 
 class TrieNode:
     def __init__(self):
@@ -544,7 +566,8 @@ print(x.shape, y.shape)
 x, y = train_loader.next_batch()
 x, y = x.to(device), y.to(device)
 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-    logits, loss = model(x, y)
+    logits, loss, acc = model(x, y)
+print(acc)
 
 # %%
 with open('./tokenizer-space.json', 'r', encoding='utf-8') as f: tokenizer_config = json.load(f)
@@ -598,17 +621,21 @@ for step in range(start_step, max_steps):
     last_step = (step == max_steps - 1)
 
     # once in a while evaluate our validation loss
-    if step % 50 == 0 or last_step:
+    if step % 25 == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
             val_loss_accum, val_loss_accum_ids, val_loss_accum_space, val_loss_accum_case = 0.0, 0.0, 0.0, 0.0
+            acc, acc_ids, acc_space, acc_case = 0.0, 0.0, 0.0, 0.0
             val_loss_steps = 20
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, losses = model(x, y)
+                    logits, losses, acces = model(x, y)
+                
+                acc, acc_ids, acc_space, acc_case = acc + acces[0] / val_loss_steps, acc_ids + acces[1] / val_loss_steps, acc_space + acces[2] / val_loss_steps, acc_case + acces[3] / val_loss_steps
+
                 (loss, loss_ids, loss_space, loss_case) = losses
                 val_loss_accum += (loss / val_loss_steps).detach()
                 val_loss_accum_ids += (loss_ids / val_loss_steps).detach()
@@ -619,9 +646,14 @@ for step in range(start_step, max_steps):
             dist.all_reduce(val_loss_accum_ids, op=dist.ReduceOp.AVG)
             dist.all_reduce(val_loss_accum_space, op=dist.ReduceOp.AVG)
             dist.all_reduce(val_loss_accum_case, op=dist.ReduceOp.AVG)
+            # TODO Loop
+            dist.all_reduce(acc, op=dist.ReduceOp.AVG)
+            dist.all_reduce(acc_ids, op=dist.ReduceOp.AVG)
+            dist.all_reduce(acc_space, op=dist.ReduceOp.AVG)
+            dist.all_reduce(acc_case, op=dist.ReduceOp.AVG)
         if master_process:
-            print(f"validation loss: {val_loss_accum.item():.4f}, ids: {val_loss_accum_ids.item():.4f}, space: {val_loss_accum_space.item():.4f}, case: {val_loss_accum_case.item():.4f}")
-            run.log({"step": step, "val/loss": val_loss_accum.item(), "val/loss_ids": val_loss_accum_ids.item(), "val/loss_space": val_loss_accum_space.item(), "val/loss_case": val_loss_accum_case.item()})
+            print(f"validation loss: {val_loss_accum.item():.4f}, ids: {val_loss_accum_ids.item():.4f}, space: {val_loss_accum_space.item():.4f}, case: {val_loss_accum_case.item():.4f} | acc: {acc.item():.2f} | acc_ids: {acc_ids.item():.2f} | acc_space: {acc_space.item():.2f} | acc_case: {acc_case.item():.2f}")
+            run.log({"step": step, "val/loss": val_loss_accum.item(), "val/loss_ids": val_loss_accum_ids.item(), "val/loss_space": val_loss_accum_space.item(), "val/loss_case": val_loss_accum_case.item(), "val/acc": acc.item(), "val/acc_ids": acc_ids.item(), "val/acc_space": acc_space.item(), "val/acc_case": acc_case.item()})
 
             if step > 0 and (step % 1000 == 0 or last_step):
                 # optionally write model checkpoints
@@ -661,7 +693,7 @@ for step in range(start_step, max_steps):
             # forward the model to get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, _ = model(xgen) # (B, T, vocab_size)
+                    logits, _, __ = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 if TRAIN_SPACE:
                     logits_id, logits_space, logits_case = logits
@@ -675,6 +707,7 @@ for step in range(start_step, max_steps):
 
                 # get the probabilities
                 probs = F.softmax(logits_id, dim=-1)
+
                 # do top-k sampling of 50 (huggingface pipeline default)
                 # topk_probs here becomes (5, 50), topk_indices is (5, 50)
                 topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
@@ -683,6 +716,8 @@ for step in range(start_step, max_steps):
                 ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
                 # gather the corresponding indices
                 xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+            
+                # xcol = torch.argmax(probs, dim=-1)
                 # append to the sequence
                 if TRAIN_SPACE:
                     xcol = pack_token(xcol, space, upper)
@@ -701,6 +736,7 @@ for step in range(start_step, max_steps):
     model.train()
     optimizer.zero_grad()
     loss_accum, loss_accum_ids, loss_accum_space, loss_accum_case = 0.0, 0.0, 0.0, 0.0
+    acc = 0.0
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
@@ -708,11 +744,12 @@ for step in range(start_step, max_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, losses = model(x, y)
+            logits, losses, acces = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
         # instead of a SUM we want MEAN. Scale the loss here so it comes out right
+        acc += acces[0] / grad_accum_steps
         (loss, loss_ids, loss_space, loss_case) = losses
         loss_accum += (loss / grad_accum_steps).detach()
         loss_accum_ids += (loss_ids / grad_accum_steps).detach()
@@ -725,10 +762,16 @@ for step in range(start_step, max_steps):
         dist.all_reduce(loss_accum_ids, op=dist.ReduceOp.AVG)
         dist.all_reduce(loss_accum_space, op=dist.ReduceOp.AVG)
         dist.all_reduce(loss_accum_case, op=dist.ReduceOp.AVG)
+        dist.all_reduce(acc, op=dist.ReduceOp.AVG)
 
-    norm_params = (param for name, param in model.named_parameters() if not name.endswith('emb_space_case.weight'))
+    norm_space = raw_model.space_upscaler.data.item() # torch.nn.utils.clip_grad_norm_((param for name, param in model.named_parameters() if name.endswith('emb_space_case.weight')), 0.002)
+
+    torch.nn.utils.clip_grad_value_(raw_model.space_upscaler, clip_value=0.000001)
+    torch.nn.utils.clip_grad_value_(raw_model.case_upscaler, clip_value=0.000001)
+
+    norm_params = (param for name, param in model.named_parameters() if not name.endswith('upscaler.weight') and not name.endswith('emb_space_case.weight'))
     norm = torch.nn.utils.clip_grad_norm_(norm_params, 1.0)
-    norm_space = torch.nn.utils.clip_grad_norm_((param for name, param in model.named_parameters() if name.endswith('emb_space_case.weight')), 0.002)
+
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
@@ -745,8 +788,8 @@ for step in range(start_step, max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         if step % 10 == 0:
-            print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | norm_space: {norm_space:.8f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}") #  | lids: {loss_accum_ids.item():.4f} | lspace: {loss_accum_space.item():.4f} | lcase: {loss_accum_case.item():.4f}
-        run.log({"step": step, "loss": loss_accum.item(), "loss_ids": loss_accum_ids.item(), "loss_space": loss_accum_space.item(), "loss_case": loss_accum_case.item(), "lr":lr, "norm":norm, "norm_space": norm_space, "dt":1000*dt, "tokens_per_sec": tokens_per_sec })
+            print(f"step {step:5d} | loss: {loss_accum.item():.6f} | acc: {acc:.2f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}") #  | lids: {loss_accum_ids.item():.4f} | lspace: {loss_accum_space.item():.4f} | lcase: {loss_accum_case.item():.4f}
+        run.log({"step": step, "loss": loss_accum.item(), "loss_ids": loss_accum_ids.item(), "loss_space": loss_accum_space.item(), "loss_case": loss_accum_case.item(), "lr":lr, "norm":norm, "norm_space": norm_space, "dt":1000*dt, "tokens_per_sec": tokens_per_sec, "acc": acc })
 
 if master_process:
     run.finish()
