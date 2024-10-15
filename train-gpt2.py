@@ -5,8 +5,8 @@
 # torchrun --standalone --nproc_per_node=4 train-gpt2.py
 
 import inspect
+import json
 import math
-# %%
 import os
 import time
 from dataclasses import dataclass
@@ -18,11 +18,13 @@ import torch.nn as nn
 import wandb
 from torch.nn import functional as F
 
+from tokenizer import SpaceTokenizer
+
 TRAIN_SPACE = True
 data_root = "dataset-25K/content/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
 
-total_batch_size = 262144 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
-B = 32 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
+total_batch_size = 294912 # 262144 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
+B = 24 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
 T = 1024 # sequence length
 
 max_lr = 6e-4
@@ -32,12 +34,18 @@ max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch siz
 
 checkpoint_path = None # "model_03000.pt" # None
 
-# %%
+vocab_size = (25000 + 257) if TRAIN_SPACE else 50257
+
+with open('./tokenizer-space.json', 'r', encoding='utf-8') as f: tokenizer_config = json.load(f)
+tokenizer = SpaceTokenizer(tokenizer_config["model"]["vocab"], vocab_size)
+
+if not TRAIN_SPACE:
+    tokenizer = tiktoken.get_encoding("gpt2")
+
 with open('wandb.txt', 'r') as file:
     wandb_key = file.read()
 wandb.login(key=wandb_key)
 
-# %%
 # From https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py
 
 class CausalSelfAttention(nn.Module):
@@ -113,44 +121,29 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
 
+        non_space_n_embed = (config.n_embd - 2) if TRAIN_SPACE else config.n_embd
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, non_space_n_embed),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(non_space_n_embed),
+        ))
+
+        self.lm_head = nn.Linear(non_space_n_embed, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
+
         if TRAIN_SPACE:
-            self.transformer = nn.ModuleDict(dict(
-                wpe = nn.Embedding(config.block_size, config.n_embd),
-                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                ln_f = nn.LayerNorm(config.n_embd - 2),
-            ))
-        else:
-            self.transformer = nn.ModuleDict(dict(
-                wte = nn.Embedding(config.vocab_size, config.n_embd),
-                wpe = nn.Embedding(config.block_size, config.n_embd),
-                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                ln_f = nn.LayerNorm(config.n_embd),
-            ))
-
-        self.lm_head = nn.Linear(config.n_embd - 2, config.vocab_size, bias=False)
-        if TRAIN_SPACE:
-            self.emb_ids = nn.Embedding(config.vocab_size, config.n_embd - 2)
-            # self.emb_space_case = nn.Linear(2, config.n_embd, bias=False)
-            # self.space_upscaler = nn.Parameter(torch.tensor(0.5))
-            # self.case_upscaler = nn.Parameter(torch.tensor(0.5))
-
-            self.lm_space = nn.Linear(config.n_embd, config.vocab_size)
-            self.lm_case = nn.Linear(config.n_embd, config.vocab_size)
-
-            self.emb_ids.weight = self.lm_head.weight
-        else:
-            # weight sharing scheme
-            self.transformer.wte.weight = self.lm_head.weight
-
+            # slight hack, we use an Embedding layer to lookup the relevant row of the weights
+            self.lm_space = nn.Embedding(config.vocab_size, config.n_embd)
+            self.lm_case = nn.Embedding(config.vocab_size, config.n_embd)
 
         # init params
         self.apply(self._init_weights)
+        # TODO does normal init work equally well?
         if TRAIN_SPACE:
-            torch.nn.init.normal_(self.emb_ids.weight, mean=0.0, std=0.02)
             torch.nn.init.normal_(self.lm_space.weight, mean=0.0, std=0.002)
             torch.nn.init.normal_(self.lm_case.weight, mean=0.0, std=0.002)
-            # torch.nn.init.normal_(self.emb_space_case.weight, mean=0.0, std=0.0000002)
-
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -172,15 +165,14 @@ class GPT(nn.Module):
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
 
+        # token embeddings of shape (B, T, n_embd)
         if TRAIN_SPACE:
-            # token embeddings of shape (B, T, n_embd)
+            # give space and case the last 2 dimensions of embed
             ids, space, upper = self.unpack_token(idx)
             space = 0.1 * (space.unsqueeze(-1).to(torch.bfloat16) - 0.5) # either -0.05 and +0.05
-            upper = 0.1 * (upper.unsqueeze(-1).to(torch.bfloat16) - 0.5)
-            # space_case = torch.cat([space, upper], dim=-1)
-            # tok_emb = self.emb_ids(ids) + self.emb_space_case(space_case)
+            case = 0.1 * (upper.unsqueeze(-1).to(torch.bfloat16) - 0.5)
 
-            tok_emb = torch.cat([self.emb_ids(ids), space, upper], dim=-1)
+            tok_emb = torch.cat([self.transformer.wte(ids), space, case], dim=-1)
         else:
             tok_emb = self.transformer.wte(idx)
 
@@ -188,41 +180,19 @@ class GPT(nn.Module):
         # forward the blocks of the transformer
         for block in self.transformer.h:
             x = block(x)
-        # forward the final layernorm and the classifier
 
+        x_f = x
 
         if TRAIN_SPACE:
-            # logits_space = self.lm_head_space(x)
-            # logits_case = self.lm_head_case(x)
-            # logits_space_case = F.linear(x, self.emb_space_case.weight.T)
-            # logits_space, logits_case = torch.split(logits_space_case, 1, dim=-1)
-            # TODO modify layernorm final to exclude space and upper
-            x_embed, _, _ = torch.split(x, [self.config.n_embd-2,1,1], dim=-1)
-            x_embed = self.transformer.ln_f(x_embed)
+            x = x[:, :, 0:self.config.n_embd-2] # remove space and upper from embed
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
 
-            # logits_space = self.space_upscaler * logits_space # allow a small output to saturate softmax
-            # logits_case = self.case_upscaler * logits_case
-            logits = self.lm_head(x_embed)
-            logits_space = self.lm_space(x)
-            logits_case = self.lm_case(x)
-            # print(logits.shape, logits_space.shape, logits_case.shape)
-        else:
-            logits = self.lm_head(x)
-            logits_space = torch.zeros((B, T, 1))
-            logits_case = torch.zeros((B, T, 1))
-
-        acc_out = None
-        loss_out = None
+        loss_out, acc_out = None, None
         if targets is not None:
             if TRAIN_SPACE:
                 targets_ids, targets_space, targets_case = self.unpack_token(targets)
-                # print(targets_ids.unsqueeze(-1).shape, logits_space.shape)
-                # logits_space = logits_space[targets_ids.unsqueeze(-1)]
-                # TODO only run lm_space and lm_case on target indices
-
-                logits_space_at_target = torch.gather(logits_space, dim=-1, index=targets_ids.unsqueeze(-1))
-                logits_case_at_target = torch.gather(logits_case, dim=-1, index=targets_ids.unsqueeze(-1))
-                # print(targets_ids.shape, logits_space_at_target.shape, targets_space.shape)
+                logits_space_at_target, logits_case_at_target = self.get_space_case_logits_at(x_f, targets_ids)
 
                 loss_ids = F.cross_entropy(logits.view(-1, logits.size(-1)), targets_ids.view(-1))
                 loss_space = F.binary_cross_entropy_with_logits(logits_space_at_target.view(-1), targets_space.view(-1).to(torch.bfloat16))
@@ -231,23 +201,30 @@ class GPT(nn.Module):
                 loss = loss_ids + 0.0001 * loss_space + 0.0001 * loss_case
                 loss_out = (loss, loss_ids, loss_space, loss_case)
 
-                count = targets.view(-1).size(0)
+                def accuracy(x, y): return (x == y).sum() / y.numel()
+
                 y_ids = torch.argmax(logits, dim=-1)
                 y_space = torch.where(logits_space_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long)).squeeze(-1)
                 y_case = torch.where(logits_case_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long)).squeeze(-1)
+                y_token = self.pack_token(y_ids, y_space, y_case)
 
-                predictions = self.pack_token(y_ids, y_space, y_case)
-                acc = (predictions == targets).sum() / count
-                acc_ids = (y_ids == targets_ids).sum() / count
-                acc_space = (y_space == targets_space).sum() / count
-                acc_case = (y_case == targets_case).sum() / count
-
-                acc_out = (acc, acc_ids, acc_space, acc_case)
+                acc_out = (accuracy(y_token, targets), accuracy(y_ids, targets_ids), accuracy(y_space, targets_space), accuracy(y_case, targets_case))
             else:
                 loss_ids = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+                acc_ids = (torch.argmax(logits, dim=-1) == targets_ids).sum() / targets.view(-1).size(0)
                 loss_out = (loss_ids, loss_ids, torch.tensor(0), torch.tensor(0))
+                acc_out = (acc_ids, acc_ids, torch.tensor(0), torch.tensor(0))
 
-        return (logits, logits_space, logits_case), loss_out, acc_out
+        return logits, loss_out, acc_out, x_f
+
+    def get_space_case_logits_at(self, x, ids):
+        logits_space_weight = self.lm_space(ids)
+        logits_case_weight = self.lm_case(ids)
+
+        assert x.shape == logits_space_weight.shape
+        logits_space = (x * logits_space_weight).sum(-1)
+        logits_case = (x * logits_case_weight).sum(-1)
+        return logits_space.unsqueeze(-1), logits_case.unsqueeze(-1)
 
     def unpack_token(self, token):
         id = token >> 2
@@ -285,10 +262,6 @@ class GPT(nn.Module):
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
-        # ignore the ones we don't have
-        new_keys = ['emb_space.weight', 'emb_case.weight', 'lm_head_space.weight', 'lm_head_case.weight', 'emb_ids.weight']
-        sd_keys = [k for k in sd_keys if not k in new_keys]
-
         # copy while ensuring all of the parameters are aligned and match in names and shapes
         sd_keys_hf = sd_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
@@ -319,14 +292,12 @@ class GPT(nn.Module):
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
 
-        low_lr_params = [p for n, p in param_dict.items() if n == "emb_space_case.weight"]
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2 and n != "emb_space_case.weight"]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2 and n != "emb_space_case.weight"]
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
 
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0},
-            {'params': low_lr_params, 'weight_decay': weight_decay},
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
@@ -341,7 +312,6 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
-# %%
 def load_tokens(filename):
     npt = np.load(filename)
     npt = npt.astype(np.int32) # added after video
@@ -387,12 +357,11 @@ class DataLoaderLite:
             self.current_position = B * T * self.process_rank
         return x, y
 
-# %%
 # -----------------------------------------------------------------------------
 # simple launch:
 # python train_gpt2.py
 # DDP launch for e.g. 8 GPUs:
-# torchrun --standalone --nproc_per_node=3 train-gpt2.py
+# torchrun --standalone --nproc_per_node=8 train-gpt2.py
 
 import torch.distributed as dist
 # run the training loop
@@ -433,7 +402,6 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-# %%
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
@@ -446,7 +414,6 @@ val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_w
 torch.set_float32_matmul_precision('high')
 
 # create model
-vocab_size = (25000 + 257) if TRAIN_SPACE else 50257
 model = GPT(GPTConfig(vocab_size=vocab_size))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 
@@ -466,137 +433,17 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
-# %%
-import json
-
-
-class TrieNode:
-    def __init__(self):
-        self.children = {}
-        self.token_id = None
-        self.token = None
-
-class Trie:
-    def __init__(self):
-        self.root = TrieNode()
-
-    def insert(self, token, token_id):
-        node = self.root
-        for char in token:
-            if char not in node.children:
-                node.children[char] = TrieNode()
-            node = node.children[char]
-        node.token_id = token_id
-        node.token = token
-
-    def search(self, text, start_pos):
-        match_token, match_token_id = None, None
-        pos = start_pos
-        node = self.root
-        while True:
-            char = text[pos]
-            if char not in node.children:
-                break
-            node = node.children[char]
-            if node.token:
-                match_token = node.token
-                match_token_id = node.token_id
-            pos += 1
-            if pos >= len(text):
-                break
-        return match_token_id, match_token
-
-def bytes_to_unicode():
-    bs = list(range(ord("!"), ord("~")+1))+list(range(ord("¡"), ord("¬")+1))+list(range(ord("®"), ord("ÿ")+1))
-    cs = bs[:]
-    n = 0
-    for b in range(2**8):
-        if b not in bs:
-            bs.append(b)
-            cs.append(2**8+n)
-            n += 1
-    cs = [chr(n) for n in cs]
-    return dict(zip(bs, cs))
-
-
-def pack_token(id, space, upper):
-    return (id << 2) + (space << 1) + (upper << 0)
-
-def upper_first(text):
-    return text[0].upper() + (text[1:] if len(text) > 1 else "")
-
-def expand_vocab(vocab, max_vocab_size):
-    updated_vocab = {}
-    for i, (token, id) in enumerate(vocab.items()):
-        if i >= max_vocab_size:
-            return updated_vocab
-        updated_vocab[pack_token(id, space=False, upper=True)] = f"{upper_first(token)}"
-        updated_vocab[pack_token(id, space=True, upper=True)] = f"Ġ{upper_first(token)}"
-        updated_vocab[pack_token(id, space=False, upper=False)] = f"{token}"
-        updated_vocab[pack_token(id, space=True, upper=False)] = f"Ġ{token}"
-    return updated_vocab
-
-
-class SpaceTokenizer():
-    def __init__(self, vocab_config, vocab_size=None):
-      self.byte_encoder = bytes_to_unicode()
-      self.byte_decoder = {v:k for k, v in self.byte_encoder.items()}
-
-      vocab_size = len(vocab_config) if vocab_size is None else vocab_size
-      self.vocab_decode = expand_vocab(vocab_config, max_vocab_size=vocab_size)
-      self.vocab = {v:k for k,v in self.vocab_decode.items()}
-
-      self.trie = Trie()
-      for token, token_id in self.vocab.items():
-          self.trie.insert(token, token_id)
-
-    def encode(self, text, return_token_tuple=False):
-        text = ''.join(self.byte_encoder[b] for b in text.encode('utf-8'))
-        pos = 0
-        ids, tokens = [], []
-        while True:
-            id, token = self.trie.search(text, pos)
-            if id is None or token is None:
-                raise Exception(f"Error encoding {text[pos:pos+16]}")
-            ids.append(id)
-            tokens.append(token)
-            pos += len(token)
-            if pos >= len(text):
-                break
-        return (ids, tokens) if return_token_tuple else ids
-
-    def decode(self, ids):
-        out = ""
-        for id in ids:
-            if not id in self.vocab_decode:
-                raise Exception(f"Error decoding {id}")
-            out += self.vocab_decode[id]
-        return bytearray([self.byte_decoder[c] for c in out]).decode('utf-8', errors="replace")
-
-# %%
+# Test if model throws any errors
 x, y = val_loader.next_batch()
 print(x.shape, y.shape)
 
 x, y = train_loader.next_batch()
 x, y = x.to(device), y.to(device)
 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-    logits, loss, acc = model(x, y)
+    logits, loss, acc, embed_f = model(x, y)
 print(acc)
 
-# %%
-with open('./tokenizer-space.json', 'r', encoding='utf-8') as f: tokenizer_config = json.load(f)
 
-vocab = tokenizer_config["model"]["vocab"]
-# vocab_size = 25000 + 257 # set previously
-
-tokenizer = SpaceTokenizer(vocab, vocab_size)
-
-if not TRAIN_SPACE:
-    tokenizer = tiktoken.get_encoding("gpt2")
-
-tokenizer.decode(list(x[0].cpu().tolist()))
-
-# %%
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -639,35 +486,25 @@ for step in range(start_step, max_steps):
         model.eval()
         val_loader.reset()
         with torch.no_grad():
-            val_loss_accum, val_loss_accum_ids, val_loss_accum_space, val_loss_accum_case = 0.0, 0.0, 0.0, 0.0
-            acc, acc_ids, acc_space, acc_case = 0.0, 0.0, 0.0, 0.0
+            loss_accum = [0.0, 0.0, 0.0, 0.0]
+            acc_accum = [0.0, 0.0, 0.0, 0.0]
             val_loss_steps = 20
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, losses, acces = model(x, y)
-                
-                acc, acc_ids, acc_space, acc_case = acc + acces[0] / val_loss_steps, acc_ids + acces[1] / val_loss_steps, acc_space + acces[2] / val_loss_steps, acc_case + acces[3] / val_loss_steps
-
-                (loss, loss_ids, loss_space, loss_case) = losses
-                val_loss_accum += (loss / val_loss_steps).detach()
-                val_loss_accum_ids += (loss_ids / val_loss_steps).detach()
-                val_loss_accum_space += (loss_space / val_loss_steps).detach()
-                val_loss_accum_case += (loss_case / val_loss_steps).detach()
+                    logits, losses, acces, _ = model(x, y)
+    
+                for i in range(4):
+                    loss_accum[i] += (losses[i] / grad_accum_steps).detach()
+                    acc_accum[i] += (acces[i] / val_loss_steps).detach()
         if ddp:
-            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-            dist.all_reduce(val_loss_accum_ids, op=dist.ReduceOp.AVG)
-            dist.all_reduce(val_loss_accum_space, op=dist.ReduceOp.AVG)
-            dist.all_reduce(val_loss_accum_case, op=dist.ReduceOp.AVG)
-            # TODO Loop
-            dist.all_reduce(acc, op=dist.ReduceOp.AVG)
-            dist.all_reduce(acc_ids, op=dist.ReduceOp.AVG)
-            dist.all_reduce(acc_space, op=dist.ReduceOp.AVG)
-            dist.all_reduce(acc_case, op=dist.ReduceOp.AVG)
+            for i in range(4):
+                dist.all_reduce(loss_accum[i], op=dist.ReduceOp.AVG)
+                dist.all_reduce(acc_accum[i], op=dist.ReduceOp.AVG)
         if master_process:
-            print(f"validation loss: {val_loss_accum.item():.4f}, ids: {val_loss_accum_ids.item():.4f}, space: {val_loss_accum_space.item():.4f}, case: {val_loss_accum_case.item():.4f} | acc: {acc.item():.2f} | acc_ids: {acc_ids.item():.2f} | acc_space: {acc_space.item():.2f} | acc_case: {acc_case.item():.2f}")
-            run.log({"step": step, "val/loss": val_loss_accum.item(), "val/loss_ids": val_loss_accum_ids.item(), "val/loss_space": val_loss_accum_space.item(), "val/loss_case": val_loss_accum_case.item(), "val/acc": acc.item(), "val/acc_ids": acc_ids.item(), "val/acc_space": acc_space.item(), "val/acc_case": acc_case.item()})
+            print(f"validation loss: {loss_accum[0].item():.4f}, ids: {loss_accum[1].item():.4f}, space: {loss_accum[2].item():.4f}, case: {loss_accum[3].item():.4f} | acc: {acc_accum[0].item():.2f} | acc_ids: {acc_accum[1].item():.2f} | acc_space: {acc_accum[2].item():.2f} | acc_case: {acc_accum[3].item():.2f}")
+            run.log({"step": step, "val/loss": loss_accum[0].item(), "val/loss_ids": loss_accum[1].item(), "val/loss_space": loss_accum[2].item(), "val/loss_case": loss_accum[3].item(), "val/acc": acc_accum[0].item(), "val/acc_ids": acc_accum[1].item(), "val/acc_space": acc_accum[2].item(), "val/acc_case": acc_accum[3].item()})
 
             if step > 0 and (step % 1000 == 0 or last_step):
                 # optionally write model checkpoints
@@ -676,21 +513,18 @@ for step in range(start_step, max_steps):
                     'model': raw_model.state_dict(),
                     'config': raw_model.config,
                     'step': step,
-                    'val_loss': val_loss_accum.item()
+                    'val_loss': loss_accum[0].item()
                 }
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
 
-                artifact = wandb.Artifact(name=f"{project_name}-model", type="model")
+                artifact = wandb.Artifact(name=f"{project_name}-model{'-full' if max_steps > 10000 else ''}", type="model")
                 artifact.add_file(local_path=checkpoint_path)
                 run.log_artifact(artifact)
 
-
     # once in a while generate from the model (except step 0, which is noise)
     if ((step > 0 and step % 100 == 0) or last_step) and (not use_compile):
-        def pack_token(id, space, upper):
-            return (id << 2) + (space << 1) + (upper << 0)
         samples = []
 
         model.eval()
@@ -707,18 +541,12 @@ for step in range(start_step, max_steps):
             # forward the model to get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, _, __ = model(xgen) # (B, T, vocab_size)
+                    logits, _, __, embed_f = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
-                if TRAIN_SPACE:
-                    logits_id, logits_space, logits_case = logits
-                    logits_id = logits_id[:, -1, :] # (B, vocab_size)
-                    logits_space = logits_space[:, -1, :] # (B, vocab_size)
-                    logits_case = logits_case[:, -1, :] # (B, vocab_size)
-                else:
-                    logits_id = logits[0][:, -1, :]
+                logits = logits[:, -1, :]
 
                 # get the probabilities
-                probs = F.softmax(logits_id, dim=-1)
+                probs = F.softmax(logits, dim=-1)
 
                 # do top-k sampling of 50 (huggingface pipeline default)
                 # topk_probs here becomes (5, 50), topk_indices is (5, 50)
@@ -728,21 +556,12 @@ for step in range(start_step, max_steps):
                 ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
                 # gather the corresponding indices
                 xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-            
-                # xcol = torch.argmax(probs, dim=-1)
-                # append to the sequence
+    
                 if TRAIN_SPACE:
-                    # print(logits_space.shape, xcol.shape)
-                    logits_space_at_target = torch.gather(logits_space, dim=-1, index=xcol)
-                    logits_case_at_target = torch.gather(logits_case, dim=-1, index=xcol)
-                    # print(logits_space_at_target.shape)
-
+                    logits_space_at_target, logits_case_at_target = raw_model.get_space_case_logits_at(embed_f[:, -1, :], xcol.squeeze(-1))
                     space = torch.where(logits_space_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long))
                     upper = torch.where(logits_case_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long))
-                    # print(logits_id.shape, logits_space.shape, logits_case.shape, space.shape )
-
-                    xcol = pack_token(xcol, space, upper)
-                    # print(xcol.shape)
+                    xcol = raw_model.pack_token(xcol, space, upper)
                 xgen = torch.cat((xgen, xcol), dim=1)
         # print the generated text
         for i in range(num_return_sequences):
@@ -757,8 +576,7 @@ for step in range(start_step, max_steps):
     # do one step of the optimization
     model.train()
     optimizer.zero_grad()
-    loss_accum, loss_accum_ids, loss_accum_space, loss_accum_case = 0.0, 0.0, 0.0, 0.0
-    acc = 0.0
+    loss_accum, acc = [0.0, 0.0, 0.0, 0.0], 0.0
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
@@ -766,41 +584,27 @@ for step in range(start_step, max_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, losses, acces = model(x, y)
+            logits, losses, acces, ___ = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
         # instead of a SUM we want MEAN. Scale the loss here so it comes out right
         acc += acces[0] / grad_accum_steps
-        (loss, loss_ids, loss_space, loss_case) = losses
-        loss_accum += (loss / grad_accum_steps).detach()
-        loss_accum_ids += (loss_ids / grad_accum_steps).detach()
-        loss_accum_space += (loss_space / grad_accum_steps).detach()
-        loss_accum_case += (loss_case / grad_accum_steps).detach()
-        loss = loss / grad_accum_steps
+        for i, loss in enumerate(losses):
+            loss_accum[i] += (loss / grad_accum_steps).detach()
+        loss = losses[0] / grad_accum_steps
         loss.backward()
     if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-        dist.all_reduce(loss_accum_ids, op=dist.ReduceOp.AVG)
-        dist.all_reduce(loss_accum_space, op=dist.ReduceOp.AVG)
-        dist.all_reduce(loss_accum_case, op=dist.ReduceOp.AVG)
+        for accum in loss_accum:
+            dist.all_reduce(accum, op=dist.ReduceOp.AVG)
         dist.all_reduce(acc, op=dist.ReduceOp.AVG)
 
-    norm_space = 0 # raw_model.space_upscaler.data.item() # torch.nn.utils.clip_grad_norm_((param for name, param in model.named_parameters() if name.endswith('emb_space_case.weight')), 0.002)
-
-    # torch.nn.utils.clip_grad_value_(raw_model.space_upscaler, clip_value=0.000001)
-    # torch.nn.utils.clip_grad_value_(raw_model.case_upscaler, clip_value=0.000001)
-
-    norm_params = (param for name, param in model.named_parameters() if not name.endswith('upscaler.weight') and not name.endswith('emb_space_case.weight'))
-    norm = torch.nn.utils.clip_grad_norm_(norm_params, 1.0)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
-        if len(param_group["params"]) == 1:
-            param_group['lr'] = 0.01 * lr
-        else:
-            param_group['lr'] = lr
+        param_group['lr'] = lr
     optimizer.step()
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
@@ -810,8 +614,8 @@ for step in range(start_step, max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         if step % 10 == 0:
-            print(f"step {step:5d} | loss: {loss_accum.item():.6f} | acc: {acc:.2f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}") #  | lids: {loss_accum_ids.item():.4f} | lspace: {loss_accum_space.item():.4f} | lcase: {loss_accum_case.item():.4f}
-        run.log({"step": step, "loss": loss_accum.item(), "loss_ids": loss_accum_ids.item(), "loss_space": loss_accum_space.item(), "loss_case": loss_accum_case.item(), "lr":lr, "norm":norm, "norm_space": norm_space, "dt":1000*dt, "tokens_per_sec": tokens_per_sec, "acc": acc })
+            print(f"step {step:5d} | loss: {loss_accum[0].item():.6f} | acc: {acc:.2f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        run.log({"step": step, "loss": loss_accum[0].item(), "loss_ids": loss_accum[1].item(), "loss_space": loss_accum[2].item(), "loss_case": loss_accum[3].item(), "lr":lr, "norm":norm, "dt":1000*dt, "tokens_per_sec": tokens_per_sec, "acc": acc })
 
 if master_process:
     run.finish()
