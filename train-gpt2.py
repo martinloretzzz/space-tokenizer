@@ -3,11 +3,13 @@
 # unzip /workspace/fineweb-25k.zip -d /workspace/dataset-25K/
 # unzip /workspace/fineweb-ref.zip -d /workspace/dataset-ref/
 # torchrun --standalone --nproc_per_node=4 train-gpt2.py
+# tmux capture-pane -pS -1000000 > log.txt
 
 import inspect
 import json
 import math
 import os
+import random
 import time
 from dataclasses import dataclass
 
@@ -18,13 +20,14 @@ import torch.nn as nn
 import wandb
 from torch.nn import functional as F
 
+from hellaswag import get_most_likely_row, iterate_examples, render_example
 from tokenizer import SpaceTokenizer
 
 TRAIN_SPACE = True
 data_root = "dataset-25K/content/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
 
-total_batch_size = 262144 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
-B = 32 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
+total_batch_size = 262144 # 262144 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
+B = 16 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
 T = 1024 # sequence length
 
 max_lr = 6e-4
@@ -32,7 +35,7 @@ min_lr = max_lr * 0.1
 warmup_steps = 500 # 715
 max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
-checkpoint_path = None # "model_03000.pt" # None
+checkpoint_path = None
 
 vocab_size = (25000 + 257) if TRAIN_SPACE else 50257
 
@@ -189,7 +192,10 @@ class GPT(nn.Module):
         loss_out, acc_out, reduced_embed = None, None, None
 
         if TRAIN_SPACE:
-            reduced_embed = self.lm_reduce(x)
+            # To optimize mainly for the tokens and not where there's a space or is uppercase
+            # TODO still let the gradients flow through this part, just extremly weak
+            x_detach = x.detach()
+            reduced_embed = self.lm_reduce(x_detach)
             x = x[:, :, 0:self.config.n_embd-2] # remove space and upper from embed
         
         logits = self.lm_head(x)
@@ -203,7 +209,7 @@ class GPT(nn.Module):
                 loss_space = F.binary_cross_entropy_with_logits(logits_space_at_target.view(-1), targets_space.view(-1).to(torch.bfloat16))
                 loss_case = F.binary_cross_entropy_with_logits(logits_case_at_target.view(-1), targets_case.view(-1).to(torch.bfloat16))
 
-                loss = loss_ids + 0.0001 * loss_space + 0.0001 * loss_case
+                loss = loss_ids + loss_space + loss_case
                 loss_out = (loss, loss_ids, loss_space, loss_case)
 
                 def accuracy(x, y): return (x == y).sum() / y.numel()
@@ -512,7 +518,7 @@ for step in range(start_step, max_steps):
             print(f"validation loss: {loss_accum[0].item():.4f}, ids: {loss_accum[1].item():.4f}, space: {loss_accum[2].item():.4f}, case: {loss_accum[3].item():.4f} | acc: {acc_accum[0].item():.2f} | acc_ids: {acc_accum[1].item():.2f} | acc_space: {acc_accum[2].item():.2f} | acc_case: {acc_accum[3].item():.2f}")
             run.log({"step": step, "val/loss": loss_accum[0].item(), "val/loss_ids": loss_accum[1].item(), "val/loss_space": loss_accum[2].item(), "val/loss_case": loss_accum[3].item(), "val/acc": acc_accum[0].item(), "val/acc_ids": acc_accum[1].item(), "val/acc_space": acc_accum[2].item(), "val/acc_case": acc_accum[3].item()})
 
-            if step > 0 and (step % 1000 == 0 or last_step):
+            if step > 0 and (step % 2000 == 0 or last_step):
                 # optionally write model checkpoints
                 checkpoint_path = f"model_{step:05d}.pt"
                 checkpoint = {
@@ -525,9 +531,44 @@ for step in range(start_step, max_steps):
                 # rng seeds etc., if you wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
 
-                artifact = wandb.Artifact(name=f"{project_name}-model", type="model")
+                artifact = wandb.Artifact(name=f"{project_name}-model-{random.randint(0, 1000)}", type="model")
                 artifact.add_file(local_path=checkpoint_path)
                 run.log_artifact(artifact)
+
+    # once in a while evaluate hellaswag
+    if (step % 250 == 0 or last_step) and (not use_compile):
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            # only process examples where i % ddp_world_size == ddp_rank
+            if i % ddp_world_size != ddp_rank:
+                continue
+            # render the example into tokens and labels
+            _, tokens, mask, label = render_example(example, tokenizer)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            # print(mask.shape, label)
+            # get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, _, __, ___ = model(tokens)
+                if TRAIN_SPACE:
+                    tokens = raw_model.unpack_token(tokens)[0]
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        # reduce the stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            run.log({"step": step, "val/hellaswag_correct": num_correct_norm, "val/hellaswag_acc": acc_norm})
 
     # once in a while generate from the model (except step 0, which is noise)
     if ((step > 0 and step % 100 == 0) or last_step) and (not use_compile):
