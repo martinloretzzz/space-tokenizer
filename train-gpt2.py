@@ -23,8 +23,8 @@ from tokenizer import SpaceTokenizer
 TRAIN_SPACE = True
 data_root = "dataset-25K/content/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
 
-total_batch_size = 294912 # 262144 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
-B = 24 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
+total_batch_size = 262144 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
+B = 32 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
 T = 1024 # sequence length
 
 max_lr = 6e-4
@@ -121,13 +121,14 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
 
-        non_space_n_embed = (config.n_embd - 2) if TRAIN_SPACE else config.n_embd
+        non_space_n_embed = (config.n_embd - 2) if TRAIN_SPACE else config.n_embd # embeding size for id's, last 2 dims are for space and case
+        space_n_embed = config.n_embd // 8 # reduced dimension for space and upper to save parameters
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, non_space_n_embed),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(non_space_n_embed),
+            ln_f = nn.LayerNorm(config.n_embd),
         ))
 
         self.lm_head = nn.Linear(non_space_n_embed, config.vocab_size, bias=False)
@@ -135,13 +136,15 @@ class GPT(nn.Module):
 
         if TRAIN_SPACE:
             # slight hack, we use an Embedding layer to lookup the relevant row of the weights
-            self.lm_space = nn.Embedding(config.vocab_size, config.n_embd)
-            self.lm_case = nn.Embedding(config.vocab_size, config.n_embd)
+            self.lm_reduce = nn.Linear(config.n_embd, space_n_embed)
+            self.lm_space = nn.Embedding(config.vocab_size, space_n_embed)
+            self.lm_case = nn.Embedding(config.vocab_size, space_n_embed)
 
         # init params
         self.apply(self._init_weights)
         # TODO does normal init work equally well?
         if TRAIN_SPACE:
+            torch.nn.init.normal_(self.lm_reduce.weight, mean=0.0, std=0.002)
             torch.nn.init.normal_(self.lm_space.weight, mean=0.0, std=0.002)
             torch.nn.init.normal_(self.lm_case.weight, mean=0.0, std=0.002)
 
@@ -181,18 +184,20 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
 
-        x_f = x
+        x = self.transformer.ln_f(x)
+
+        loss_out, acc_out, reduced_embed = None, None, None
 
         if TRAIN_SPACE:
+            reduced_embed = self.lm_reduce(x)
             x = x[:, :, 0:self.config.n_embd-2] # remove space and upper from embed
-        x = self.transformer.ln_f(x)
+        
         logits = self.lm_head(x)
 
-        loss_out, acc_out = None, None
         if targets is not None:
             if TRAIN_SPACE:
                 targets_ids, targets_space, targets_case = self.unpack_token(targets)
-                logits_space_at_target, logits_case_at_target = self.get_space_case_logits_at(x_f, targets_ids)
+                logits_space_at_target, logits_case_at_target = self.get_space_case_logits_at(reduced_embed, targets_ids)
 
                 loss_ids = F.cross_entropy(logits.view(-1, logits.size(-1)), targets_ids.view(-1))
                 loss_space = F.binary_cross_entropy_with_logits(logits_space_at_target.view(-1), targets_space.view(-1).to(torch.bfloat16))
@@ -211,11 +216,12 @@ class GPT(nn.Module):
                 acc_out = (accuracy(y_token, targets), accuracy(y_ids, targets_ids), accuracy(y_space, targets_space), accuracy(y_case, targets_case))
             else:
                 loss_ids = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-                acc_ids = (torch.argmax(logits, dim=-1) == targets_ids).sum() / targets.view(-1).size(0)
-                loss_out = (loss_ids, loss_ids, torch.tensor(0), torch.tensor(0))
-                acc_out = (acc_ids, acc_ids, torch.tensor(0), torch.tensor(0))
+                acc_ids = (torch.argmax(logits, dim=-1) == targets).sum() / targets.numel()
+                zero = torch.tensor(0, device=targets.device)
+                loss_out = (loss_ids, loss_ids, zero, zero)
+                acc_out = (acc_ids, acc_ids, zero, zero)
 
-        return logits, loss_out, acc_out, x_f
+        return logits, loss_out, acc_out, reduced_embed
 
     def get_space_case_logits_at(self, x, ids):
         logits_space_weight = self.lm_space(ids)
@@ -461,7 +467,7 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 if master_process:
-    project_name = f"x-{'25K' if vocab_size < 26000 else '50K'}" if TRAIN_SPACE else "x-ref"
+    project_name = f"x-{'25K' if vocab_size < 26000 else '50K'}{'-ref' if not TRAIN_SPACE else ''}{'-full' if max_steps > 10000 else ''}"
     run = wandb.init(
         project="space-gpt",
         name=project_name,
@@ -496,7 +502,7 @@ for step in range(start_step, max_steps):
                     logits, losses, acces, _ = model(x, y)
     
                 for i in range(4):
-                    loss_accum[i] += (losses[i] / grad_accum_steps).detach()
+                    loss_accum[i] += (losses[i] / val_loss_steps).detach()
                     acc_accum[i] += (acces[i] / val_loss_steps).detach()
         if ddp:
             for i in range(4):
@@ -519,7 +525,7 @@ for step in range(start_step, max_steps):
                 # rng seeds etc., if you wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
 
-                artifact = wandb.Artifact(name=f"{project_name}-model{'-full' if max_steps > 10000 else ''}", type="model")
+                artifact = wandb.Artifact(name=f"{project_name}-model", type="model")
                 artifact.add_file(local_path=checkpoint_path)
                 run.log_artifact(artifact)
 
