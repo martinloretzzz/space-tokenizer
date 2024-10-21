@@ -50,6 +50,12 @@ def bytes_to_unicode():
 def pack_token(id, space, upper):
     return (id << 2) + (space << 1) + (upper << 0)
 
+def unpack_token(token):
+    id = token >> 2
+    space = (token >> 1) & 0x01
+    upper = (token >> 0) & 0x01
+    return id, space, upper
+
 def upper_first(text):
     return text[0].upper() + (text[1:] if len(text) > 1 else "")
 
@@ -100,3 +106,14 @@ class SpaceTokenizer():
                 raise Exception(f"Error decoding {id}")
             out += self.vocab_decode[id]
         return bytearray([self.byte_decoder[c] for c in out]).decode('utf-8', errors="replace")
+
+class HfTokenizerWrapper():
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def encode(self, text, return_token_tuple=False):
+        output = self.tokenizer.encode(text)
+        return (output.ids, output.tokens) if return_token_tuple else output.ids
+
+    def decode(self, ids):
+        return self.tokenizer.decode(ids)
