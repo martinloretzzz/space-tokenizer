@@ -57,7 +57,6 @@ if not TRAIN_SPACE:
     
 with open('wandb.txt', 'r') as file:
     wandb_key = file.read()
-wandb.login(key=wandb_key)
 
 # From https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py
 
@@ -200,13 +199,16 @@ class GPT(nn.Module):
 
         x = self.transformer.ln_f(x)
 
+        self.hook = None
         loss_out, acc_out, reduced_embed = None, None, None
 
         if TRAIN_SPACE:
-            # To optimize mainly for the tokens and not where there's a space or is uppercase
-            # TODO still let the gradients flow through this part, just extremly weak
-            x_detach = x.detach()
-            reduced_embed = self.lm_reduce(x_detach)
+            x_grad_scaler = x.clone()
+            if x.requires_grad:
+                if self.hook is not None:
+                    raise Exception("Hook still exists")
+                self.hook = x_grad_scaler.register_hook(lambda grad: grad * 0.01) 
+            reduced_embed = self.lm_reduce(x_grad_scaler)
         
         logits = self.lm_head(x)
 
@@ -238,6 +240,10 @@ class GPT(nn.Module):
                 acc_out = (acc_ids, acc_ids, zero, zero)
 
         return logits, loss_out, acc_out, reduced_embed
+
+    def remove_hooks(self):
+        if self.hook is not None:
+            self.hook.remove()
 
     def get_space_case_logits_at(self, x, ids):
         logits_space_weight = self.lm_space(ids)
@@ -474,6 +480,7 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 if master_process:
+    wandb.login(key=wandb_key)
     project_name = f"x-{'25K' if vocab_size < 26000 else '50K'}{'-ref' if not TRAIN_SPACE else ''}{'-full' if max_steps > 10000 else ''}"
     model_artifact_name = f"{project_name}-model-{random.randint(0, 1000)}"
     run = wandb.init(
@@ -541,7 +548,7 @@ for step in range(start_step, max_steps):
 
 
     # once in a while evaluate hellaswag
-    if (step > 0 and step % 100 == 0 or last_step) and (not use_compile):
+    if (step % 100 == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
         for i, example in enumerate(iterate_examples("val")):
@@ -648,6 +655,7 @@ for step in range(start_step, max_steps):
             loss_accum[i] += (loss / grad_accum_steps).detach()
         loss = losses[0] / grad_accum_steps
         loss.backward()
+        raw_model.remove_hooks()
     if ddp:
         for accum in loss_accum:
             dist.all_reduce(accum, op=dist.ReduceOp.AVG)
