@@ -35,14 +35,14 @@ ENABLE_WANDB = True
 
 data_root = "dataset-space/content/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
 
-total_batch_size = 262144 # 294912@24 262144@16/32 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
+total_batch_size = 524288 # 294912@24 262144@16/32 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
 B = 16 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
 T = 1024 # sequence length
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 500 # 715
-max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 715 # 715
+max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
 checkpoint_path = None
 
