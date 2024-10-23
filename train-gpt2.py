@@ -8,7 +8,8 @@
 
 # dataset-space-20k-rs: 10.09 BT
 # dataset-ref-20k: 11.2 BT
-# dataset-ref-50k: 9.95
+# dataset-ref-50k: 9.95 BT
+# dataset-space-50k-rs: 9.59 BT (?)
 
 import inspect
 import json
@@ -26,10 +27,10 @@ import wandb
 from torch.nn import functional as F
 
 from hellaswag import get_most_likely_row, iterate_examples, render_example
+from model import GPT, GPTConfig
 from tokenizer import (HfTokenizerWrapper, SpaceTokenizer, pack_token,
                        unpack_token)
 from tokenizers import Tokenizer
-from model import GPT, GPTConfig
 
 TRAIN_SPACE = True
 ENABLE_WANDB = False
