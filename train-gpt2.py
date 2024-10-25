@@ -7,9 +7,10 @@
 # tmux capture-pane -pS -1000000 > log.txt
 
 # dataset-space-20k-rs: 10.09 BT
+# dataset-space-50k-rs: 9.59 BT
 # dataset-ref-20k: 11.2 BT
-# dataset-ref-50k: 9.95 BT
-# dataset-space-50k-rs: 9.59 BT (?)
+# dataset-ref-50k: 10.35 BT
+# dataset-ref-50k-tiktoken: 9.95 BT
 
 import inspect
 import json
@@ -32,13 +33,13 @@ from tokenizer import (HfTokenizerWrapper, SpaceTokenizer, pack_token,
                        unpack_token)
 from tokenizers import Tokenizer
 
-TRAIN_SPACE = True
-ENABLE_WANDB = False
+TRAIN_SPACE = False
+ENABLE_WANDB = True
 
-data_root = "dataset-space/content/drive/MyDrive/Colab Notebooks/space/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
+data_root = "dataset-space/content/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
 
 total_batch_size = 524288 # 294912@24 262144@16/32 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
-B = 16 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
+B = 8 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
 T = 1024 # sequence length
 
 max_lr = 6e-4
@@ -48,14 +49,14 @@ max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch si
 
 checkpoint_path = None
 
-vocab_size = (20000 + 257) #  if TRAIN_SPACE else 50257
+vocab_size = (50000 + 257) #  if TRAIN_SPACE else 50257
 
-with open('./tokenizer-space-20k-rs.json', 'r', encoding='utf-8') as f: tokenizer_config = json.load(f)
+with open('./tokenizer-space-50k-rs.json', 'r', encoding='utf-8') as f: tokenizer_config = json.load(f)
 tokenizer = SpaceTokenizer(tokenizer_config)
 
 if not TRAIN_SPACE:
     # tokenizer = tiktoken.get_encoding("gpt2")
-    tokenizer = HfTokenizerWrapper(Tokenizer.from_file("tokenizer-ref-20k.json"))
+    tokenizer = HfTokenizerWrapper(Tokenizer.from_file("tokenizer-ref-50k.json"))
     
 with open('wandb.txt', 'r') as file:
     wandb_key = file.read()
