@@ -38,14 +38,14 @@ ENABLE_WANDB = True
 
 data_root = "dataset-space/content/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
 
-total_batch_size = 524288 # 294912@24 262144@16/32 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
-B = 8 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
+total_batch_size = 262144 # 294912@24 262144@16/32 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
+B = 4 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
 T = 1024 # sequence length
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 715 # 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 500 # 715
+max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
 checkpoint_path = None
 
@@ -55,18 +55,34 @@ with open('./tokenizer-space-50k-rs.json', 'r', encoding='utf-8') as f: tokenize
 tokenizer = SpaceTokenizer(tokenizer_config)
 
 if not TRAIN_SPACE:
-    # tokenizer = tiktoken.get_encoding("gpt2")
-    tokenizer = HfTokenizerWrapper(Tokenizer.from_file("tokenizer-ref-50k.json"))
+    tokenizer = tiktoken.get_encoding("gpt2")
+    # tokenizer = HfTokenizerWrapper(Tokenizer.from_file("tokenizer-ref-50k.json"))
+    vocab_distance_file = "./vocab-distances-qn.npy"
+    scale_distances_fn = lambda x: x ** 6
     
 with open('wandb.txt', 'r') as file:
     wandb_key = file.read()
 
+
+def load_vocab_distances(filename):
+    npt = np.load(filename)
+    # npt = npt == 255
+    ptt = torch.tensor(npt, dtype=torch.bfloat16)
+    return ptt / 255.0
 
 def load_tokens(filename):
     npt = np.load(filename)
     npt = npt.astype(np.int32) # added after video
     ptt = torch.tensor(npt, dtype=torch.long)
     return ptt
+
+vocab_distances = load_vocab_distances(vocab_distance_file)
+vocab_distances = scale_distances_fn(vocab_distances)
+print(vocab_distances.shape)
+print(vocab_distances[256:266, 256:266])
+
+y = torch.tensor([[2,3,1,4], [3,2,1,4]])
+print(torch.argmax(vocab_distances[y], dim=-1)[0:10])
 
 class DataLoaderLite:
     def __init__(self, B, T, process_rank, num_processes, split):
@@ -183,12 +199,15 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
+vocab_distances = vocab_distances.to(device)
+
 # Test if model throws any errors
 x, y = val_loader.next_batch()
 print(x.shape, y.shape)
 
 x, y = train_loader.next_batch()
 x, y = x.to(device), y.to(device)
+y = vocab_distances[y]
 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
     logits, loss, acc, embed_f = model(x, y)
 print(acc)
@@ -245,6 +264,7 @@ for step in range(start_step, max_steps):
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
+                y = vocab_distances[y]
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, losses, acces, _ = model(x, y)
     
@@ -372,6 +392,7 @@ for step in range(start_step, max_steps):
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
+        y = vocab_distances[y]
         # added after video, this field is also used by the forward pass.
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
@@ -411,7 +432,7 @@ for step in range(start_step, max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         if step % 10 == 0:
-            print(f"step {step:5d} | loss: {loss_accum[0].item():.6f} | acc: {acc:.2f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | space_norm: {space_emb_norm:0.2f}")
+            print(f"step {step:5d} | loss: {loss_accum[0].item():.6f} | acc: {acc:.4f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | space_norm: {space_emb_norm:0.2f}")
         run.log({"step": step, "loss": loss_accum[0].item(), "loss_ids": loss_accum[1].item(), "loss_space": loss_accum[2].item(), "loss_case": loss_accum[3].item(), "lr":lr, "norm":norm, "dt":1000*dt, "tokens_per_sec": tokens_per_sec, "acc": acc, "space_norm": space_emb_norm })
 
 if master_process:

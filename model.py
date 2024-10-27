@@ -2,10 +2,13 @@
 
 import inspect
 from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
 from tokenizer import pack_token, unpack_token
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -181,8 +184,18 @@ class GPT(nn.Module):
 
                 acc_out = (accuracy(y_token, targets), accuracy(y_ids, targets_ids), accuracy(y_space, targets_space), accuracy(y_case, targets_case))
             else:
-                loss_ids = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-                acc_ids = (torch.argmax(logits, dim=-1) == targets).sum() / targets.numel()
+                k = 4
+                topk_vals, topk_indices = torch.topk(targets, k, dim=-1)
+
+                logits_reshape = logits.view(-1, logits.size(-1))
+                loss_ids_0 = torch.mean(topk_vals[:,:,0].view(-1) * F.cross_entropy(logits_reshape, topk_indices[:,:,0].view(-1), reduction='none'))
+                loss_ids_1 = torch.mean(topk_vals[:,:,1].view(-1)* F.cross_entropy(logits_reshape, topk_indices[:,:,1].view(-1), reduction='none'))
+                loss_ids_2 = torch.mean(topk_vals[:,:,2].view(-1) * F.cross_entropy(logits_reshape, topk_indices[:,:,2].view(-1), reduction='none'))
+                loss_ids_3 = torch.mean(topk_vals[:,:,3].view(-1) * F.cross_entropy(logits_reshape, topk_indices[:,:,3].view(-1), reduction='none'))
+                loss_ids = (loss_ids_0 + loss_ids_1 + loss_ids_2 + loss_ids_3) / 4
+
+                numel = targets.shape[0] * targets.shape[1] # B * T
+                acc_ids = (torch.argmax(logits, dim=-1) == torch.argmax(targets, dim=-1)).sum() / numel
                 zero = torch.tensor(0, device=targets.device)
                 loss_out = (loss_ids, loss_ids, zero, zero)
                 acc_out = (acc_ids, acc_ids, zero, zero)
