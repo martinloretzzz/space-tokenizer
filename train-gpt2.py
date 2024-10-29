@@ -38,16 +38,17 @@ ENABLE_WANDB = True
 
 data_root = "dataset-space/content/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
 
-total_batch_size = 524288 # 294912@24 262144@16/32 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
+total_batch_size = 262144 # 294912@24 262144@16/32 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
 B = 8 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
 T = 1024 # sequence length
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 715 # 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 500 # 715
+max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
 checkpoint_path = None
+cluster_decay = 10
 
 vocab_size = (50000 + 257) #  if TRAIN_SPACE else 50257
 
@@ -55,12 +56,15 @@ with open('./tokenizer-space-50k-rs.json', 'r', encoding='utf-8') as f: tokenize
 tokenizer = SpaceTokenizer(tokenizer_config)
 
 if not TRAIN_SPACE:
-    # tokenizer = tiktoken.get_encoding("gpt2")
-    tokenizer = HfTokenizerWrapper(Tokenizer.from_file("tokenizer-ref-50k.json"))
+    tokenizer = tiktoken.get_encoding("gpt2")
+    # tokenizer = HfTokenizerWrapper(Tokenizer.from_file("tokenizer-ref-50k.json"))
     
 with open('wandb.txt', 'r') as file:
     wandb_key = file.read()
 
+vocab_cluster_np = np.load(f"token-neighbours.npy").astype(np.int32)
+vocab_cluster = torch.from_numpy(vocab_cluster_np).to(torch.long)
+print("vocab_clusters", vocab_cluster.shape)
 
 def load_tokens(filename):
     npt = np.load(filename)
@@ -187,12 +191,28 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 x, y = val_loader.next_batch()
 print(x.shape, y.shape)
 
+vocab_cluster = vocab_cluster.to(device)
+
+def cluster_differnece(input_embedding, pad_token=-1):
+    # this will sample from pad_token at position -1, but we'll mask it later
+    vocab_cluster_embeddings = input_embedding[vocab_cluster]
+    vocab_cluster_embeddings = torch.where((vocab_cluster != pad_token).unsqueeze(-1), vocab_cluster_embeddings, torch.zeros_like(vocab_cluster_embeddings))
+    vocab_cluster_count = (vocab_cluster != pad_token).sum(-1) # .to(torch.float)
+    vocab_cluster_mean = vocab_cluster_embeddings.sum(-2) / vocab_cluster_count.unsqueeze(-1)
+
+    return vocab_cluster_mean - input_embedding
+
+
+def cluster_decay_loss(input_embedding):
+    diff = cluster_differnece(input_embedding)
+    return (diff ** 2).sum()
+
+
 x, y = train_loader.next_batch()
 x, y = x.to(device), y.to(device)
 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
     logits, loss, acc, embed_f = model(x, y)
-print(acc)
-
+    print(cluster_decay * cluster_decay_loss(raw_model.transformer.wte.weight))
 
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -257,8 +277,11 @@ for step in range(start_step, max_steps):
                 dist.all_reduce(acc_accum[i], op=dist.ReduceOp.AVG)
 
         if master_process:
-            print(f"validation loss: {loss_accum[0].item():.4f}, ids: {loss_accum[1].item():.4f}, space: {loss_accum[2].item():.4f}, case: {loss_accum[3].item():.4f} | acc: {acc_accum[0].item():.2f} | acc_ids: {acc_accum[1].item():.2f} | acc_space: {acc_accum[2].item():.2f} | acc_case: {acc_accum[3].item():.2f}")
-            run.log({"step": step, "val/loss": loss_accum[0].item(), "val/loss_ids": loss_accum[1].item(), "val/loss_space": loss_accum[2].item(), "val/loss_case": loss_accum[3].item(), "val/acc": acc_accum[0].item(), "val/acc_ids": acc_accum[1].item(), "val/acc_space": acc_accum[2].item(), "val/acc_case": acc_accum[3].item()})
+            with torch.no_grad():
+                cluster_diff = cluster_differnece(raw_model.transformer.wte.weight)
+                cluster_loss = (cluster_diff ** 2).sum()
+            print(f"validation loss: {loss_accum[0].item():.4f}, ids: {loss_accum[1].item():.4f}, loss_cluster: {cluster_loss.item():.4f}, space: {loss_accum[2].item():.4f}, case: {loss_accum[3].item():.4f} | acc: {acc_accum[0].item():.2f} | acc_ids: {acc_accum[1].item():.2f} | acc_space: {acc_accum[2].item():.2f} | acc_case: {acc_accum[3].item():.2f}")
+            run.log({"step": step, "val/loss": loss_accum[0].item(), "val/loss_ids": loss_accum[1].item(), "val/loss_cluster": cluster_loss.item(), "val/loss_space": loss_accum[2].item(), "val/loss_case": loss_accum[3].item(), "val/acc": acc_accum[0].item(), "val/acc_ids": acc_accum[1].item(), "val/acc_space": acc_accum[2].item(), "val/acc_case": acc_accum[3].item()})
 
             if step > 0 and (step % 2000 == 0 or last_step):
                 # optionally write model checkpoints
@@ -392,6 +415,7 @@ for step in range(start_step, max_steps):
             dist.all_reduce(accum, op=dist.ReduceOp.AVG)
         dist.all_reduce(acc, op=dist.ReduceOp.AVG)
 
+
     space_emb_norm = 0
     if TRAIN_SPACE:
         space_emb_norm = torch.nn.utils.clip_grad_norm_(raw_model.emb_space.parameters(), 0.0001)
@@ -402,6 +426,12 @@ for step in range(start_step, max_steps):
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+
+    with torch.no_grad():
+        cluster_diff = cluster_differnece(raw_model.transformer.wte.weight)
+        cluster_loss = (cluster_diff ** 2).sum()
+        raw_model.transformer.wte.weight += lr * cluster_decay * cluster_diff
+
     optimizer.step()
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
@@ -411,8 +441,8 @@ for step in range(start_step, max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         if step % 10 == 0:
-            print(f"step {step:5d} | loss: {loss_accum[0].item():.6f} | acc: {acc:.2f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | space_norm: {space_emb_norm:0.2f}")
-        run.log({"step": step, "loss": loss_accum[0].item(), "loss_ids": loss_accum[1].item(), "loss_space": loss_accum[2].item(), "loss_case": loss_accum[3].item(), "lr":lr, "norm":norm, "dt":1000*dt, "tokens_per_sec": tokens_per_sec, "acc": acc, "space_norm": space_emb_norm })
+            print(f"step {step:5d} | loss: {loss_accum[0].item():.6f} | loss_cluster: {cluster_loss.item():.4f} | acc: {acc:.2f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | space_norm: {space_emb_norm:0.2f}")
+        run.log({"step": step, "loss": loss_accum[0].item(), "loss_ids": loss_accum[1].item(), "loss_cluster": cluster_loss.item(), "loss_space": loss_accum[2].item(), "loss_case": loss_accum[3].item(), "lr":lr, "norm":norm, "dt":1000*dt, "tokens_per_sec": tokens_per_sec, "acc": acc, "space_norm": space_emb_norm })
 
 if master_process:
     run.finish()
