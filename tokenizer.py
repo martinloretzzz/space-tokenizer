@@ -59,6 +59,9 @@ def unpack_token(token):
 def upper_first(text):
     return text[0].upper() + (text[1:] if len(text) > 1 else "")
 
+def lower_first(text):
+    return (text[0].lower() + text[1:]) if len(text) > 1 else text
+
 def expand_vocab(vocab, max_vocab_size):
     updated_vocab = {}
     for i, (token, id) in enumerate(vocab.items()):
@@ -72,12 +75,12 @@ def expand_vocab(vocab, max_vocab_size):
 
 
 class SpaceTokenizer():
-    def __init__(self, vocab_config, vocab_size=None):
+    def __init__(self, vocab_config, vocab_size=None, space_expand_vocab=True):
       self.byte_encoder = bytes_to_unicode()
       self.byte_decoder = {v:k for k, v in self.byte_encoder.items()}
 
       vocab_size = len(vocab_config) if vocab_size is None else vocab_size
-      self.vocab_decode = expand_vocab(vocab_config, max_vocab_size=vocab_size)
+      self.vocab_decode = expand_vocab(vocab_config, max_vocab_size=vocab_size) if space_expand_vocab else vocab_config
       self.vocab = {v:k for k,v in self.vocab_decode.items()}
 
       self.trie = Trie()

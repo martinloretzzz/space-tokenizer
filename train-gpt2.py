@@ -38,25 +38,31 @@ ENABLE_WANDB = True
 
 data_root = "dataset-space/content/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
 
-total_batch_size = 524288 # 294912@24 262144@16/32 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
+total_batch_size = 262144 # 294912@24 262144@16/32 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
 B = 8 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
 T = 1024 # sequence length
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 715 # 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 500 # 715
+max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
 checkpoint_path = None
 
 vocab_size = (50000 + 257) #  if TRAIN_SPACE else 50257
+
+project_name = f"lin-{'25K' if vocab_size < 26000 else '50K'}{'-ref' if not TRAIN_SPACE else ''}{'-full' if max_steps > 10000 else ''}"
 
 with open('./tokenizer-space-50k-rs.json', 'r', encoding='utf-8') as f: tokenizer_config = json.load(f)
 tokenizer = SpaceTokenizer(tokenizer_config)
 
 if not TRAIN_SPACE:
     # tokenizer = tiktoken.get_encoding("gpt2")
-    tokenizer = HfTokenizerWrapper(Tokenizer.from_file("tokenizer-ref-50k.json"))
+    # tokenizer = HfTokenizerWrapper(Tokenizer.from_file("tokenizer-ref-50k.json"))
+    with open('./tokenizer-ref-50k-lin.json', 'r', encoding='utf-8') as f:
+        tokenizer_config = json.load(f)["model"]["vocab"]
+        tokenizer_config = {v:k for k, v in tokenizer_config.items()}
+    tokenizer = SpaceTokenizer(tokenizer_config, space_expand_vocab=False)
     
 with open('wandb.txt', 'r') as file:
     wandb_key = file.read()
@@ -212,7 +218,6 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 
 if master_process:
     wandb.login(key=wandb_key)
-    project_name = f"x-{'25K' if vocab_size < 26000 else '50K'}{'-ref' if not TRAIN_SPACE else ''}{'-full' if max_steps > 10000 else ''}"
     model_artifact_name = f"{project_name}-model-{random.randint(0, 1000)}"
     run = wandb.init(
         project="space-gpt",
