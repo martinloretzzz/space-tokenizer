@@ -33,28 +33,31 @@ from tokenizer import (HfTokenizerWrapper, SpaceTokenizer, pack_token,
                        unpack_token)
 from tokenizers import Tokenizer
 
-TRAIN_SPACE = False
+TRAIN_SPACE = True
 ENABLE_WANDB = True
 
-data_root = "dataset-space/content/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
+data_root = "dataset-space/content/drive/MyDrive/Colab Notebooks/space/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
 
-total_batch_size = 524288 # 294912@24 262144@16/32 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
+total_batch_size = 262144 # 294912@24 262144@16/32 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
 B = 8 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
 T = 1024 # sequence length
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 715 # 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 500 # 715
+max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
-checkpoint_path = None
+checkpoint_path = "artifacts/d-25K-model-608:v2/model_04999.pt"
 
-vocab_size = (50000 + 257) #  if TRAIN_SPACE else 50257
+vocab_size = (20000 + 257) #  if TRAIN_SPACE else 50257
 
-with open('./tokenizer-space-50k-rs.json', 'r', encoding='utf-8') as f: tokenizer_config = json.load(f)
+project_name = f"d-{'25K' if vocab_size < 26000 else '50K'}{'-ref' if not TRAIN_SPACE else ''}{'-full' if max_steps > 10000 else ''}"
+
+with open('./tokenizer-space-20k-rs.json', 'r', encoding='utf-8') as f: tokenizer_config = json.load(f)
 tokenizer = SpaceTokenizer(tokenizer_config)
 
 if not TRAIN_SPACE:
+
     # tokenizer = tiktoken.get_encoding("gpt2")
     tokenizer = HfTokenizerWrapper(Tokenizer.from_file("tokenizer-ref-50k.json"))
     
@@ -212,7 +215,6 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 
 if master_process:
     wandb.login(key=wandb_key)
-    project_name = f"x-{'25K' if vocab_size < 26000 else '50K'}{'-ref' if not TRAIN_SPACE else ''}{'-full' if max_steps > 10000 else ''}"
     model_artifact_name = f"{project_name}-model-{random.randint(0, 1000)}"
     run = wandb.init(
         project="space-gpt",
@@ -295,8 +297,8 @@ for step in range(start_step, max_steps):
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, _, __, ___ = model(tokens)
-                if TRAIN_SPACE:
-                    tokens = unpack_token(tokens)[0]
+                # if TRAIN_SPACE:
+                #    tokens = unpack_token(tokens)[0]
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
             num_correct_norm += int(pred_norm == label)
@@ -348,11 +350,11 @@ for step in range(start_step, max_steps):
                 # gather the corresponding indices
                 xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
     
-                if TRAIN_SPACE:
-                    logits_space_at_target, logits_case_at_target = raw_model.get_space_case_logits_at(embed_f[:, -1, :], xcol.squeeze(-1))
-                    space = torch.where(logits_space_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long))
-                    upper = torch.where(logits_case_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long))
-                    xcol = pack_token(xcol, space, upper)
+                #if TRAIN_SPACE:
+                #    logits_space_at_target, logits_case_at_target = raw_model.get_space_case_logits_at(embed_f[:, -1, :], xcol.squeeze(-1))
+                #    space = torch.where(logits_space_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long))
+                #    upper = torch.where(logits_case_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long))
+                #    xcol = pack_token(xcol, space, upper)
                 xgen = torch.cat((xgen, xcol), dim=1)
         # print the generated text
         for i in range(num_return_sequences):
@@ -396,6 +398,7 @@ for step in range(start_step, max_steps):
     if TRAIN_SPACE:
         space_emb_norm = torch.nn.utils.clip_grad_norm_(raw_model.emb_space.parameters(), 0.0001)
         case_emb_norm = torch.nn.utils.clip_grad_norm_(raw_model.emb_case.parameters(), 0.0001)
+        case_emb_norm = torch.nn.utils.clip_grad_norm_(raw_model.lm_head_space_case.parameters(), 0.0002)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
     # determine and set the learning rate for this iteration

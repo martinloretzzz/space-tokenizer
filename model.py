@@ -2,10 +2,13 @@
 
 import inspect
 from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
 from tokenizer import pack_token, unpack_token
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -94,24 +97,18 @@ class GPT(nn.Module):
         self.transformer.wte.weight = self.lm_head.weight
 
         if self.TRAIN_SPACE:
-            # slight hack, we use an Embedding layer to lookup the relevant row of the weights
-            self.lm_reduce = nn.Linear(config.n_embd, space_n_embed)
-            self.lm_space = nn.Embedding(config.vocab_size, space_n_embed)
-            self.lm_case = nn.Embedding(config.vocab_size, space_n_embed)
-
             self.emb_space = nn.Embedding(2, config.n_embd)
             self.emb_case = nn.Embedding(2, config.n_embd)
+            self.lm_head_space_case = nn.Embedding(4, config.n_embd)
 
         # init params
         self.apply(self._init_weights)
         # TODO does normal init work equally well?
         if self.TRAIN_SPACE:
-            torch.nn.init.normal_(self.lm_reduce.weight, mean=0.0, std=0.002)
-            torch.nn.init.normal_(self.lm_space.weight, mean=0.0, std=0.002)
-            torch.nn.init.normal_(self.lm_case.weight, mean=0.0, std=0.002)
-
             torch.nn.init.normal_(self.emb_space.weight, mean=0.0, std=0.00002)
             torch.nn.init.normal_(self.emb_case.weight, mean=0.0, std=0.00002)
+            torch.nn.init.normal_(self.lm_head_space_case.weight, mean=0.0, std=0.00002)
+
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -150,48 +147,35 @@ class GPT(nn.Module):
         self.hook = None
         loss_out, acc_out, reduced_embed = None, None, None
 
-        if self.TRAIN_SPACE:
-            x_grad_scaler = x.clone()
-            if x.requires_grad:
-                if self.hook is not None:
-                    raise Exception("Hook still exists")
-                self.hook = x_grad_scaler.register_hook(lambda grad: grad * 0.01) 
-            reduced_embed = self.lm_reduce(x_grad_scaler)
-        
-        logits = self.lm_head(x)
+        # print("ws", self.emb_space.weight[0].shape)
+        embed_lower_no_space = x + self.lm_head_space_case.weight[0]
+        embed_upper_no_space = x + self.lm_head_space_case.weight[1]
+        embed_lower_space = x + self.lm_head_space_case.weight[2]
+        embed_upper_space = x + self.lm_head_space_case.weight[3]
+    
+        # print("s", embed_lower_no_space.shape)
+        # print(self.lm_head(embed_lower_no_space).shape)
+        logits_list = (self.lm_head(embed_lower_no_space), self.lm_head(embed_upper_no_space), self.lm_head(embed_lower_space), self.lm_head(embed_upper_space))
+        logits = torch.stack(logits_list, dim=-1).reshape(B, T, -1)
+        # print(torch.stack(logits_list, dim=-1).shape)
+        # print(logits.shape)
 
         if targets is not None:
-            if self.TRAIN_SPACE:
-                targets_ids, targets_space, targets_case = unpack_token(targets)
-                logits_space_at_target, logits_case_at_target = self.get_space_case_logits_at(reduced_embed, targets_ids)
+            loss_ids = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
-                loss_ids = F.cross_entropy(logits.view(-1, logits.size(-1)), targets_ids.view(-1))
-                loss_space = F.binary_cross_entropy_with_logits(logits_space_at_target.view(-1), targets_space.view(-1).to(torch.bfloat16))
-                loss_case = F.binary_cross_entropy_with_logits(logits_case_at_target.view(-1), targets_case.view(-1).to(torch.bfloat16))
+            targets_ids, _, __ = unpack_token(targets)
+            loss_token_ids, _, __ = unpack_token(torch.argmax(logits, dim=-1))
 
-                loss = loss_ids + loss_space + loss_case
-                loss_out = (loss, loss_ids, loss_space, loss_case)
-
-                def accuracy(x, y): return (x == y).sum() / y.numel()
-
-                y_ids = torch.argmax(logits, dim=-1)
-                y_space = torch.where(logits_space_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long)).squeeze(-1)
-                y_case = torch.where(logits_case_at_target > 0, torch.tensor(1, dtype=torch.long), torch.tensor(0, dtype=torch.long)).squeeze(-1)
-                y_token = pack_token(y_ids, y_space, y_case)
-
-                acc_out = (accuracy(y_token, targets), accuracy(y_ids, targets_ids), accuracy(y_space, targets_space), accuracy(y_case, targets_case))
-            else:
-                loss_ids = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-                acc_ids = (torch.argmax(logits, dim=-1) == targets).sum() / targets.numel()
-                zero = torch.tensor(0, device=targets.device)
-                loss_out = (loss_ids, loss_ids, zero, zero)
-                acc_out = (acc_ids, acc_ids, zero, zero)
+            acc = (torch.argmax(logits, dim=-1) == targets).sum() / targets.numel()
+            acc_ids = (loss_token_ids == targets_ids).sum() / targets.numel()
+            zero = torch.tensor(0, device=targets.device)
+            loss_out = (loss_ids, loss_ids, zero, zero)
+            acc_out = (acc, acc_ids, zero, zero)
 
         return logits, loss_out, acc_out, reduced_embed
 
     def remove_hooks(self):
-        if self.hook is not None:
-            self.hook.remove()
+        pass
 
     def get_space_case_logits_at(self, x, ids):
         logits_space_weight = self.lm_space(ids)
