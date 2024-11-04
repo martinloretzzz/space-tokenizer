@@ -2,7 +2,7 @@
 # pip install transformers wandb tiktoken
 # unzip /workspace/dataset-space-20k-rs.zip -d /workspace/dataset-space/
 # unzip /workspace/dataset-ref-20k.zip -d /workspace/dataset-ref/
-# torchrun --standalone --nproc_per_node=4 train-gpt2.py
+# torchrun --standalone --nproc_per_node=2 train-gpt2.py
 # python train-gpt2.py
 # tmux capture-pane -pS -1000000 > log.txt
 
@@ -11,6 +11,7 @@
 # dataset-ref-20k: 11.2 BT
 # dataset-ref-50k: 10.35 BT
 # dataset-ref-50k-tiktoken: 9.95 BT
+# dataset-ref-50k-tiktoken-linear: 9.93 BT
 
 import inspect
 import json
@@ -38,29 +39,29 @@ ENABLE_WANDB = True
 
 data_root = "dataset-space/content/data/" if TRAIN_SPACE else "dataset-ref/content/data/"
 
-total_batch_size = 262144 # 294912@24 262144@16/32 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
+total_batch_size = 524288 # 294912@24 262144@16/32 # 294912 # 491520 # 524288 # 2**19, ~0.5M, in number of tokens
 B = 8 # 48 # 96 if TRAIN_SPACE else 80 # 64 # micro batch size # 64
 T = 1024 # sequence length
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 500 # 715
-max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 715 # 715
+max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
-checkpoint_path = None
+checkpoint_path = "./artifacts/lin-50K-ref-full-model-799:v1/model_04000.pt"
 
 vocab_size = (50000 + 257) #  if TRAIN_SPACE else 50257
 
 project_name = f"lin-{'25K' if vocab_size < 26000 else '50K'}{'-ref' if not TRAIN_SPACE else ''}{'-full' if max_steps > 10000 else ''}"
 
-with open('./tokenizer-space-50k-rs.json', 'r', encoding='utf-8') as f: tokenizer_config = json.load(f)
-tokenizer = SpaceTokenizer(tokenizer_config)
+# with open('./tokenizer-space-50k-rs.json', 'r', encoding='utf-8') as f: tokenizer_config = json.load(f)
+# tokenizer = SpaceTokenizer(tokenizer_config)
 
 if not TRAIN_SPACE:
     # tokenizer = tiktoken.get_encoding("gpt2")
     # tokenizer = HfTokenizerWrapper(Tokenizer.from_file("tokenizer-ref-50k.json"))
-    with open('./tokenizer-ref-50k-lin.json', 'r', encoding='utf-8') as f:
-        tokenizer_config = json.load(f)["model"]["vocab"]
+    with open('./vocab-gpt2-tt.json', 'r', encoding='utf-8') as f:
+        tokenizer_config = json.load(f)
         tokenizer_config = {v:k for k, v in tokenizer_config.items()}
     tokenizer = SpaceTokenizer(tokenizer_config, space_expand_vocab=False)
     
@@ -284,7 +285,7 @@ for step in range(start_step, max_steps):
 
 
     # once in a while evaluate hellaswag
-    if (step % 100 == 0 or last_step) and (not use_compile):
+    if (step % 50 == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
         for i, example in enumerate(iterate_examples("val")):
