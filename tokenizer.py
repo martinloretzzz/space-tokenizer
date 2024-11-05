@@ -1,38 +1,45 @@
 class TrieNode:
     def __init__(self):
+        self.id = None
         self.children = {}
-        self.token_id = None
-        self.token = None
 
 class Trie:
     def __init__(self):
         self.root = TrieNode()
 
-    def insert(self, token, token_id):
+    def insert(self, token, id):
         node = self.root
         for char in token:
             if char not in node.children:
                 node.children[char] = TrieNode()
             node = node.children[char]
-        node.token_id = token_id
-        node.token = token
+        node.id = id
 
     def search(self, text, start_pos):
-        match_token, match_token_id = None, None
+        match_id = None
         pos = start_pos
+        token_len = 0
         node = self.root
-        while True:
+        while pos < len(text):
             char = text[pos]
             if char not in node.children:
                 break
             node = node.children[char]
-            if node.token:
-                match_token = node.token
-                match_token_id = node.token_id
+            if node.id is not None:
+                match_id = node.id
+                token_len = (pos - start_pos) + 1
             pos += 1
-            if pos >= len(text):
-                break
-        return match_token_id, match_token
+        return match_id, token_len
+    
+    def encode(self, text):
+        pos = 0
+        ids = []
+        while pos < len(text):
+            id, token_length = self.search(text, pos)
+            ids.append(id)
+            pos += token_length
+        return ids
+
 
 def bytes_to_unicode():
     bs = list(range(ord("!"), ord("~")+1))+list(range(ord("¡"), ord("¬")+1))+list(range(ord("®"), ord("ÿ")+1))
@@ -89,18 +96,11 @@ class SpaceTokenizer():
 
     def encode(self, text, return_token_tuple=False):
         text = ''.join(self.byte_encoder[b] for b in text.encode('utf-8'))
-        pos = 0
-        ids, tokens = [], []
-        while True:
-            id, token = self.trie.search(text, pos)
-            if id is None or token is None:
-                raise Exception(f"Error encoding {text[pos:pos+16]}")
-            ids.append(id)
-            tokens.append(token)
-            pos += len(token)
-            if pos >= len(text):
-                break
-        return (ids, tokens) if return_token_tuple else ids
+        ids = self.trie.encode(text)
+
+        if return_token_tuple:
+            return (ids, [self.vocab_decode[id] for id in ids])
+        return ids
 
     def decode(self, ids):
         out = ""
@@ -109,6 +109,7 @@ class SpaceTokenizer():
                 raise Exception(f"Error decoding {id}")
             out += self.vocab_decode[id]
         return bytearray([self.byte_decoder[c] for c in out]).decode('utf-8', errors="replace")
+
 
 class HfTokenizerWrapper():
     def __init__(self, tokenizer):
